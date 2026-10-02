@@ -60,6 +60,10 @@ public interface LinenCategoryMapper {
     @Select("SELECT * FROM linen_category WHERE code = #{code}")
     LinenCategory selectByCode(@Param("code") String code);
 
+    /** 悲观行锁：配方版本发布 / 停用 / 新建草稿前锁品类行，串行化同品类并发操作 */
+    @Select("SELECT * FROM linen_category WHERE id = #{id} FOR UPDATE")
+    LinenCategory selectByIdForUpdate(@Param("id") Long id);
+
     @Select("""
             SELECT c.*,
                    GREATEST(0, c.min_turnover - c.stock_qty) AS gap,

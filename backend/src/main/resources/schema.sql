@@ -95,11 +95,14 @@ CREATE TABLE IF NOT EXISTS wash_batch (
   water_temp        INT          NOT NULL DEFAULT 0  COMMENT '水温 ℃',
   machine_id        BIGINT                DEFAULT NULL COMMENT '水洗机 id',
   operator          VARCHAR(32)           DEFAULT NULL COMMENT '当班操作员',
-  status            VARCHAR(16)  NOT NULL DEFAULT 'RUNNING' COMMENT 'RUNNING 在产 / HOLD 挂起 / DONE 已完成 / QUARANTINED 污染隔离中',
+  status            VARCHAR(16)  NOT NULL DEFAULT 'RUNNING' COMMENT 'RUNNING 在产 / HOLD 挂起 / DONE 已完成 / QUARANTINED 污染隔离中 / REVIEW 参数偏差待复核',
   start_time        DATETIME              DEFAULT NULL,
   finish_time       DATETIME              DEFAULT NULL,
   rewash_order_id   BIGINT                DEFAULT NULL COMMENT '若本批次是污染复洗产生的新批次，对应复洗单 id；否则为空',
   quarantine_was_done TINYINT  NOT NULL DEFAULT 0 COMMENT '被污染命中隔离前是否已是 DONE 批次（放行时据此决定恢复 RUNNING 还是保持 DONE）',
+  recipe_version_id BIGINT                DEFAULT NULL COMMENT '建批时所用洗涤配方版本 id',
+  recipe_version_no INT                   DEFAULT NULL COMMENT '所用配方版本号（冗余冻结，不随版本表后续变化）',
+  recipe_snapshot   JSON                  DEFAULT NULL COMMENT '批次配方快照：建批时冻结八道工序标准参数与容差，后续发布/停用版本不影响本批',
   remark            VARCHAR(255)          DEFAULT NULL,
   PRIMARY KEY (id),
   UNIQUE KEY uk_batch_no (batch_no),
@@ -451,5 +454,136 @@ INSERT INTO operation_log (biz_type, biz_id, action_name, detail, created_at) VA
   ('CATEGORY', 4, '调整在库', '浴巾 -20', TIMESTAMP(CURDATE(), '09:05:00')),
   ('OUTLET', 7, '新增网点', '市第一人民医院', TIMESTAMP(DATE_SUB(CURDATE(), INTERVAL 1 DAY), '08:30:00')),
   ('BATCH', 9, '批次完工', '折叠完成，入库 76 件', TIMESTAMP(DATE_SUB(CURDATE(), INTERVAL 1 DAY), '22:10:00'));
+
+-- ---------- 13. 洗涤配方版本 ----------
+-- 按布草品类维护预洗至折叠八道工序的目标水温 / 洗涤剂用量 / 适用设备类型。
+-- 生命周期：DRAFT 草稿（可反复调整）→ PUBLISHED 当前生效（不可原地改写，只能复制生成新版本）→ DISABLED 已停用。
+-- current_flag 为存储生成列：仅 PUBLISHED 为 1；UNIQUE(category_id, current_flag) 保证每个品类
+-- 同时只有一个当前配方版本——两人同时发布不同草稿时，数据库层兜底只有一份能生效，另一份报冲突。
+CREATE TABLE IF NOT EXISTS wash_recipe_version (
+  id              BIGINT       NOT NULL AUTO_INCREMENT,
+  category_id     BIGINT       NOT NULL                COMMENT '布草品类 id',
+  version_no      INT          NOT NULL                COMMENT '品类内版本号，从 1 递增',
+  status          VARCHAR(16)  NOT NULL DEFAULT 'DRAFT' COMMENT 'DRAFT 草稿 / PUBLISHED 当前生效 / DISABLED 已停用',
+  machine_types   VARCHAR(64)  NOT NULL DEFAULT 'WASHER' COMMENT '可承接设备类型，逗号分隔（WASHER/DRYER/IRONER）',
+  max_load_ratio  INT          NOT NULL DEFAULT 90     COMMENT '最大装载比例 %：批次重量 ≤ 设备容量 × 比例',
+  base_version_id BIGINT                DEFAULT NULL   COMMENT '草稿基线版本 id（创建草稿时的当前生效版本，发布冲突检测依据）',
+  remark          VARCHAR(255)          DEFAULT NULL,
+  created_by      VARCHAR(32)           DEFAULT NULL,
+  created_at      DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  published_by    VARCHAR(32)           DEFAULT NULL,
+  published_at    DATETIME              DEFAULT NULL,
+  disabled_by     VARCHAR(32)           DEFAULT NULL,
+  disabled_at     DATETIME              DEFAULT NULL,
+  current_flag    TINYINT GENERATED ALWAYS AS (CASE WHEN status = 'PUBLISHED' THEN 1 ELSE NULL END) STORED COMMENT '当前版本标记，用于唯一索引',
+  PRIMARY KEY (id),
+  UNIQUE KEY uk_recipe_current (category_id, current_flag),
+  UNIQUE KEY uk_recipe_version (category_id, version_no),
+  KEY idx_recipe_category (category_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='洗涤配方版本';
+
+-- ---------- 14. 配方版本工序参数 ----------
+-- 每个版本固定八道工序一行：目标水温 / 水温容差 / 目标洗涤剂 / 洗涤剂容差 / 本工序适用设备类型。
+CREATE TABLE IF NOT EXISTS wash_recipe_step (
+  id                  BIGINT      NOT NULL AUTO_INCREMENT,
+  version_id          BIGINT      NOT NULL            COMMENT '配方版本 id',
+  step_code           VARCHAR(16) NOT NULL            COMMENT '工序编码',
+  step_name           VARCHAR(16) NOT NULL            COMMENT '工序名称',
+  step_order          INT         NOT NULL            COMMENT '工序号 1~8',
+  target_temp         INT         NOT NULL DEFAULT 0  COMMENT '目标水温 ℃',
+  temp_tolerance      INT         NOT NULL DEFAULT 5  COMMENT '水温容差 ±℃',
+  target_detergent_ml INT         NOT NULL DEFAULT 0  COMMENT '目标洗涤剂用量 ml',
+  detergent_tolerance INT         NOT NULL DEFAULT 100 COMMENT '洗涤剂容差 ±ml',
+  machine_types       VARCHAR(64) NOT NULL DEFAULT '' COMMENT '本工序适用设备类型，逗号分隔；空 = 不占设备',
+  PRIMARY KEY (id),
+  UNIQUE KEY uk_recipe_step (version_id, step_code)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='配方版本工序参数';
+
+-- ---------- 15. 批次参数偏差复核 ----------
+-- 推进工序时实际水温 / 洗涤剂超出批次快照容差：批次转 REVIEW 待复核并落本表（PENDING），
+-- 主管填写原因后选择 RELEASED 按本批次放行 / REDONE 退回重做；结论只影响该批次，不回写配方。
+CREATE TABLE IF NOT EXISTS batch_deviation_review (
+  id                  BIGINT      NOT NULL AUTO_INCREMENT,
+  batch_id            BIGINT      NOT NULL            COMMENT '批次 id',
+  step_code           VARCHAR(16) NOT NULL            COMMENT '超差工序编码',
+  step_name           VARCHAR(16) NOT NULL            COMMENT '超差工序名称',
+  step_order          INT         NOT NULL            COMMENT '工序号 1~8',
+  std_water_temp      INT                  DEFAULT NULL COMMENT '快照标准水温 ℃',
+  std_detergent_ml    INT                  DEFAULT NULL COMMENT '快照标准洗涤剂 ml',
+  actual_water_temp   INT                  DEFAULT NULL COMMENT '实际录入水温 ℃',
+  actual_detergent_ml INT                  DEFAULT NULL COMMENT '实际录入洗涤剂 ml',
+  target_step         VARCHAR(16)          DEFAULT NULL COMMENT '被拦截推进的目标工序编码；NULL = 收口完工',
+  next_water_temp     INT                  DEFAULT NULL COMMENT '原计划下一工序水温（放行时按此继续）',
+  next_detergent_ml   INT                  DEFAULT NULL COMMENT '原计划下一工序洗涤剂（放行时按此继续）',
+  operator            VARCHAR(32)          DEFAULT NULL COMMENT '当班操作员',
+  status              VARCHAR(16) NOT NULL DEFAULT 'PENDING' COMMENT 'PENDING 待复核 / RELEASED 已放行 / REDONE 已退回重做',
+  reason              VARCHAR(255)         DEFAULT NULL COMMENT '主管复核原因（必填）',
+  reviewer            VARCHAR(32)          DEFAULT NULL COMMENT '复核人（主管）',
+  decided_at          DATETIME             DEFAULT NULL COMMENT '复核时间',
+  created_at          DATETIME    NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (id),
+  KEY idx_review_batch (batch_id),
+  KEY idx_review_status (status)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='批次参数偏差复核';
+
+-- ---------- 种子数据：洗涤配方版本（8 个品类各一份 V1 当前生效） ----------
+-- 医感布草（手术衣 / 病号服）装载比例收紧到 80%，其余 90%。
+INSERT INTO wash_recipe_version (category_id, version_no, status, machine_types, max_load_ratio,
+                                 remark, created_by, published_by, published_at)
+SELECT c.id, 1, 'PUBLISHED', 'WASHER',
+       CASE WHEN c.code IN ('LC-SUR', 'LC-PAT') THEN 80 ELSE 90 END,
+       '初始发布：按工艺卡默认参数建档', '系统初始化', '系统初始化', NOW()
+  FROM linen_category c;
+
+-- ---------- 种子数据：配方工序参数（八道工序，洗涤剂目标按品类区分） ----------
+INSERT INTO wash_recipe_step (version_id, step_code, step_name, step_order, target_temp,
+                              temp_tolerance, target_detergent_ml, detergent_tolerance, machine_types)
+SELECT v.id, s.step_code, s.step_name, s.step_order, s.target_temp,
+       5, d.det, 100, s.mtypes
+  FROM wash_recipe_version v
+  JOIN linen_category c ON c.id = v.category_id
+  JOIN (SELECT 'LC-BED' AS code, 900 AS det UNION ALL SELECT 'LC-QUI', 850
+        UNION ALL SELECT 'LC-PIL', 520 UNION ALL SELECT 'LC-TWL', 760
+        UNION ALL SELECT 'LC-TAB', 1100 UNION ALL SELECT 'LC-UNI', 700
+        UNION ALL SELECT 'LC-SUR', 460 UNION ALL SELECT 'LC-PAT', 480) d ON d.code = c.code
+  JOIN (SELECT 1 AS step_order, 'PRE_WASH' AS step_code, '预洗' AS step_name, 35 AS target_temp, 'WASHER' AS mtypes
+        UNION ALL SELECT 2, 'MAIN_WASH', '主洗', 70, 'WASHER'
+        UNION ALL SELECT 3, 'RINSE', '漂洗', 45, 'WASHER'
+        UNION ALL SELECT 4, 'NEUTRALIZE', '中和', 40, 'WASHER'
+        UNION ALL SELECT 5, 'EXTRACT', '脱水', 0, 'WASHER'
+        UNION ALL SELECT 6, 'DRY', '烘干', 75, 'DRYER'
+        UNION ALL SELECT 7, 'IRON', '烫平', 160, 'IRONER'
+        UNION ALL SELECT 8, 'FOLD', '折叠', 0, '') s;
+
+-- 病号服按品类台账备注：高温 75℃ 主洗
+UPDATE wash_recipe_step s
+  JOIN wash_recipe_version v ON v.id = s.version_id
+  JOIN linen_category c ON c.id = v.category_id
+   SET s.target_temp = 75
+ WHERE c.code = 'LC-PAT' AND s.step_code = 'MAIN_WASH';
+
+-- ---------- 回填：为已建批次冻结配方版本与完整批次快照 ----------
+-- 快照内容 = 版本号 + 可承接设备类型 + 最大装载比例 + 八道工序标准参数；
+-- 之后版本发布 / 停用都不再影响这些批次（在产批次按原快照继续执行）。
+UPDATE wash_batch b
+  JOIN wash_recipe_version v ON v.category_id = b.category_id AND v.status = 'PUBLISHED'
+   SET b.recipe_version_id = v.id,
+       b.recipe_version_no = v.version_no,
+       b.recipe_snapshot = JSON_OBJECT(
+           'versionId', v.id,
+           'versionNo', v.version_no,
+           'categoryId', v.category_id,
+           'machineTypes', v.machine_types,
+           'maxLoadRatio', v.max_load_ratio,
+           'steps', (SELECT JSON_ARRAYAGG(t.j) FROM (
+                       SELECT JSON_OBJECT(
+                           'stepCode', s.step_code, 'stepName', s.step_name, 'stepOrder', s.step_order,
+                           'targetTemp', s.target_temp, 'tempTolerance', s.temp_tolerance,
+                           'targetDetergentMl', s.target_detergent_ml,
+                           'detergentTolerance', s.detergent_tolerance,
+                           'machineTypes', s.machine_types) AS j
+                         FROM wash_recipe_step s
+                        WHERE s.version_id = v.id
+                        ORDER BY s.step_order) t));
 
 -- 初始化完成

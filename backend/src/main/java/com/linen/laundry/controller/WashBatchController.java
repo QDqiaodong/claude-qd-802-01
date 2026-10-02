@@ -17,6 +17,7 @@ import com.linen.laundry.common.WashProcess;
 import com.linen.laundry.domain.WashBatch;
 import com.linen.laundry.dto.BatchAdvanceRequest;
 import com.linen.laundry.dto.BatchCreateRequest;
+import com.linen.laundry.dto.ReviewResolveRequest;
 import com.linen.laundry.dto.StepStat;
 import com.linen.laundry.service.WashBatchService;
 
@@ -67,11 +68,18 @@ public class WashBatchController {
         return ApiResponse.success("排产成功", batchService.create(request));
     }
 
-    /** 推进到下一道工序（不允许跳步） */
+    /** 推进到下一道工序（不允许跳步；实际值超出批次快照容差则转待复核） */
     @PostMapping("/{id}/advance")
     public ApiResponse<WashBatch> advance(@PathVariable Long id,
                                           @RequestBody(required = false) BatchAdvanceRequest request) {
         return ApiResponse.success("工序已推进", batchService.advance(id, request));
+    }
+
+    /** 主管复核参数偏差：按本批次放行或退回重做，结论只影响该批次 */
+    @PostMapping("/reviews/{reviewId}/resolve")
+    public ApiResponse<WashBatch> resolveReview(@PathVariable Long reviewId,
+                                                @RequestBody ReviewResolveRequest request) {
+        return ApiResponse.success("复核完成", batchService.resolveReview(reviewId, request));
     }
 
     @DeleteMapping("/{id}")

@@ -42,7 +42,7 @@ public class WashBatchSqlProvider {
         if (categoryId != null && !categoryId.toString().isBlank()) {
             sql.append(" AND b.category_id = #{categoryId} ");
         }
-        sql.append(" ORDER BY FIELD(b.status, 'QUARANTINED', 'RUNNING', 'HOLD', 'DONE'), b.current_step_order, b.start_time DESC ");
+        sql.append(" ORDER BY FIELD(b.status, 'QUARANTINED', 'REVIEW', 'RUNNING', 'HOLD', 'DONE'), b.current_step_order, b.start_time DESC ");
         sql.append(" LIMIT 100 ");
         return sql.toString();
     }

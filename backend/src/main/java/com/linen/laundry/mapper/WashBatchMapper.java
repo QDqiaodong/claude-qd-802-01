@@ -25,6 +25,8 @@ import com.linen.laundry.dto.StepStat;
 
 /**
  * 洗涤批次：一条查询带出工序流转记录（@Many）、品类（@One）与设备（@One）。
+ * 批次冗余冻结所用配方版本号与完整快照（recipe_snapshot）：发布后内容不可原地改写，
+ * 在产批次按建批时快照继续执行，不受后来发布 / 停用影响。
  */
 @Mapper
 public interface WashBatchMapper {
@@ -57,7 +59,7 @@ public interface WashBatchMapper {
               FROM wash_batch b
               LEFT JOIN linen_category c ON c.id = b.category_id
               LEFT JOIN machine m        ON m.id = b.machine_id
-             ORDER BY FIELD(b.status, 'QUARANTINED', 'RUNNING', 'HOLD', 'DONE'), b.start_time DESC
+             ORDER BY FIELD(b.status, 'QUARANTINED', 'REVIEW', 'RUNNING', 'HOLD', 'DONE'), b.start_time DESC
             """)
     @Results(id = "batchMap", value = {
             @Result(property = "id", column = "id", id = true),
@@ -73,6 +75,9 @@ public interface WashBatchMapper {
             @Result(property = "finishTime", column = "finish_time"),
             @Result(property = "rewashOrderId", column = "rewash_order_id"),
             @Result(property = "quarantineWasDone", column = "quarantine_was_done"),
+            @Result(property = "recipeVersionId", column = "recipe_version_id"),
+            @Result(property = "recipeVersionNo", column = "recipe_version_no"),
+            @Result(property = "recipeSnapshot", column = "recipe_snapshot"),
             @Result(property = "categoryName", column = "category_name"),
             @Result(property = "machineName", column = "machine_name"),
             @Result(property = "machineCode", column = "machine_code"),
@@ -162,10 +167,12 @@ public interface WashBatchMapper {
     @Insert("""
             INSERT INTO wash_batch (batch_no, category_id, weight_kg, current_step, current_step_order,
                                     detergent_ml, water_temp, machine_id, operator, status,
-                                    start_time, finish_time, rewash_order_id, remark)
+                                    start_time, finish_time, rewash_order_id,
+                                    recipe_version_id, recipe_version_no, recipe_snapshot, remark)
             VALUES (#{batchNo}, #{categoryId}, #{weightKg}, #{currentStep}, #{currentStepOrder},
                     #{detergentMl}, #{waterTemp}, #{machineId}, #{operator}, #{status},
-                    #{startTime}, #{finishTime}, #{rewashOrderId}, #{remark})
+                    #{startTime}, #{finishTime}, #{rewashOrderId},
+                    #{recipeVersionId}, #{recipeVersionNo}, #{recipeSnapshot}, #{remark})
             """)
     @Options(useGeneratedKeys = true, keyProperty = "id", keyColumn = "id")
     int insert(WashBatch batch);
@@ -192,13 +199,40 @@ public interface WashBatchMapper {
     @Options(useGeneratedKeys = true, keyProperty = "id", keyColumn = "id")
     int insertStep(BatchStep step);
 
-    /** 把上一道工序收口为 DONE */
+    /** 把上一道工序收口为 DONE，并回填本工序实际录入值 */
     @Update("""
             UPDATE batch_step
-               SET status = 'DONE', end_time = NOW()
+               SET status = 'DONE', end_time = NOW(),
+                   water_temp = IFNULL(#{waterTemp}, water_temp),
+                   detergent_ml = IFNULL(#{detergentMl}, detergent_ml)
              WHERE batch_id = #{batchId} AND step_code = #{stepCode}
             """)
-    int finishStep(@Param("batchId") Long batchId, @Param("stepCode") String stepCode);
+    int finishStep(@Param("batchId") Long batchId, @Param("stepCode") String stepCode,
+                   @Param("waterTemp") Integer waterTemp, @Param("detergentMl") Integer detergentMl);
+
+    /** 超差进入待复核：把实际录入值记到当前工序行（工序保持 CURRENT，等主管结论） */
+    @Update("""
+            UPDATE batch_step
+               SET water_temp = IFNULL(#{waterTemp}, water_temp),
+                   detergent_ml = IFNULL(#{detergentMl}, detergent_ml)
+             WHERE batch_id = #{batchId} AND step_code = #{stepCode} AND status = 'CURRENT'
+            """)
+    int recordStepActuals(@Param("batchId") Long batchId, @Param("stepCode") String stepCode,
+                          @Param("waterTemp") Integer waterTemp, @Param("detergentMl") Integer detergentMl);
+
+    /** 批次状态直改（待复核 / 复核退回等在产状态间切换） */
+    @Update("UPDATE wash_batch SET status = #{status} WHERE id = #{id}")
+    int updateStatus(@Param("id") Long id, @Param("status") String status);
+
+    /** 超差待复核：冻结批次当前实际值并转 REVIEW */
+    @Update("""
+            UPDATE wash_batch
+               SET water_temp = IFNULL(#{waterTemp}, water_temp),
+                   detergent_ml = IFNULL(#{detergentMl}, detergent_ml),
+                   status = #{status}
+             WHERE id = #{id}
+            """)
+    int freezeForReview(WashBatch batch);
 
     @Delete("DELETE FROM batch_step WHERE batch_id = #{batchId}")
     int deleteSteps(@Param("batchId") Long batchId);
@@ -206,14 +240,14 @@ public interface WashBatchMapper {
     @Delete("DELETE FROM wash_batch WHERE id = #{id}")
     int delete(@Param("id") Long id);
 
-    /** 工序站位统计：当前停在各工序的在产（非隔离）批次与重量 */
+    /** 工序站位统计：当前停在各工序的在产（含待复核，非隔离）批次与重量 */
     @Select("""
             SELECT b.current_step                        AS step_code,
                    MIN(b.current_step_order)             AS step_order,
                    COUNT(*)                              AS batch_count,
                    IFNULL(ROUND(SUM(b.weight_kg), 0), 0) AS total_weight
               FROM wash_batch b
-             WHERE b.status = 'RUNNING'
+             WHERE b.status IN ('RUNNING', 'REVIEW')
              GROUP BY b.current_step
              ORDER BY step_order
             """)
@@ -224,6 +258,7 @@ public interface WashBatchMapper {
                    SUM(CASE WHEN status = 'RUNNING' THEN 1 ELSE 0 END)        AS running_batch,
                    SUM(CASE WHEN status = 'DONE' THEN 1 ELSE 0 END)           AS done_batch,
                    SUM(CASE WHEN status = 'QUARANTINED' THEN 1 ELSE 0 END)    AS quarantined_batch,
+                   SUM(CASE WHEN status = 'REVIEW' THEN 1 ELSE 0 END)         AS review_batch,
                    IFNULL(ROUND(SUM(CASE WHEN status = 'RUNNING' THEN weight_kg ELSE 0 END), 0), 0) AS running_weight
               FROM wash_batch
             """)

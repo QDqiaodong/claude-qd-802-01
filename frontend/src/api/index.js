@@ -67,7 +67,20 @@ export const batchApi = {
   detail: (id) => http.get(`/batches/${id}`),
   create: (payload) => http.post('/batches', payload),
   advance: (id, payload) => http.post(`/batches/${id}/advance`, payload || {}),
+  resolveReview: (reviewId, payload) => http.post(`/batches/reviews/${reviewId}/resolve`, payload),
   remove: (id) => http.delete(`/batches/${id}`)
+}
+
+export const recipeApi = {
+  list: (params) => http.get('/recipes', { params }),
+  current: (categoryId) => http.get('/recipes/current', { params: { categoryId } }),
+  detail: (id) => http.get(`/recipes/${id}`),
+  createDraft: (payload) => http.post('/recipes/drafts', payload),
+  saveDraft: (id, payload) => http.put(`/recipes/drafts/${id}`, payload),
+  removeDraft: (id) => http.delete(`/recipes/drafts/${id}`),
+  copy: (id) => http.post(`/recipes/${id}/copy`),
+  publish: (id, payload) => http.post(`/recipes/${id}/publish`, payload || {}),
+  disable: (id, payload) => http.post(`/recipes/${id}/disable`, payload)
 }
 
 export const machineApi = {

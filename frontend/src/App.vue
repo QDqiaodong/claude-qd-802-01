@@ -114,6 +114,7 @@ const groups = [
     desc: '批次排产 / 工序流转 / 医感追溯',
     children: [
       { name: '批次隧道流转', path: '/batches' },
+      { name: '洗涤配方版本台', path: '/recipes' },
       { name: '医院布草污染追溯', path: '/contamination' }
     ]
   },

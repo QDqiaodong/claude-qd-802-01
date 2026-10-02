@@ -6,6 +6,8 @@ import java.util.List;
 
 import lombok.Data;
 
+import com.linen.laundry.dto.RecipeSnapshot;
+
 /**
  * 洗涤批次：一缸布草从预洗到折叠的流转主体。
  */
@@ -35,6 +37,12 @@ public class WashBatch {
     private Long rewashOrderId;
     /** 被污染命中隔离前是否已是 DONE（放行时据此决定恢复 RUNNING 还是保持 DONE） */
     private Boolean quarantineWasDone;
+    /** 建批时所用洗涤配方版本 id */
+    private Long recipeVersionId;
+    /** 所用配方版本号（冗余冻结，不随版本表后续变化） */
+    private Integer recipeVersionNo;
+    /** 批次配方快照 JSON：建批时冻结八道工序标准参数，后续发布/停用不影响本批 */
+    private String recipeSnapshot;
     private String remark;
 
     // ------- 非表字段 -------
@@ -43,6 +51,10 @@ public class WashBatch {
     private String machineCode;
     /** 进度百分比 */
     private Integer progress;
+    /** 批次配方快照解析结果（八道工序标准参数，详情/隧道展示用） */
+    private List<RecipeSnapshot.StepStd> recipeSteps;
+    /** 参数偏差复核记录（详情展示用） */
+    private List<BatchDeviationReview> reviews;
     /** 工序流转记录（嵌套 @Many 带出） */
     private List<BatchStep> steps;
     /** 品类（嵌套 @One 带出） */

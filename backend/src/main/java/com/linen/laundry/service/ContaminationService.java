@@ -235,7 +235,7 @@ public class ContaminationService {
         rewash.setRewashNo(rewashNoOf(rewash.getId(), rewash.getCreatedAt()));
         rewashMapper.updateRewashNo(rewash.getId(), rewash.getRewashNo());
 
-        // 复洗必须形成可追溯的新批次，并关联原批次
+        // 复洗必须形成可追溯的新批次，并关联原批次；配方版本与快照沿用原批次冻结内容（复洗按原批次配方执行）
         WashBatch rb = new WashBatch();
         rb.setBatchNo(rewashBatchNoOf(rewash));
         rb.setCategoryId(source.getCategoryId());
@@ -248,6 +248,9 @@ public class ContaminationService {
         rb.setOperator(operator);
         rb.setStatus("RUNNING");
         rb.setStartTime(LocalDateTime.now());
+        rb.setRecipeVersionId(source.getRecipeVersionId());
+        rb.setRecipeVersionNo(source.getRecipeVersionNo());
+        rb.setRecipeSnapshot(source.getRecipeSnapshot());
         rb.setRewashOrderId(rewash.getId());
         rb.setRemark("污染复洗批次，源于 " + source.getBatchNo()
                 + "（事件 " + event.getEventNo() + "）");
