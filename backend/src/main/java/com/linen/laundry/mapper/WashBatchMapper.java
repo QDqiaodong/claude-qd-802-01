@@ -73,6 +73,10 @@ public interface WashBatchMapper {
             @Result(property = "finishTime", column = "finish_time"),
             @Result(property = "rewashOrderId", column = "rewash_order_id"),
             @Result(property = "quarantineWasDone", column = "quarantine_was_done"),
+            @Result(property = "formulaVersionId", column = "formula_version_id"),
+            @Result(property = "formulaVersionNo", column = "formula_version_no"),
+            @Result(property = "formulaSnapshot", column = "formula_snapshot"),
+            @Result(property = "reviewStatus", column = "review_status"),
             @Result(property = "categoryName", column = "category_name"),
             @Result(property = "machineName", column = "machine_name"),
             @Result(property = "machineCode", column = "machine_code"),
@@ -162,10 +166,14 @@ public interface WashBatchMapper {
     @Insert("""
             INSERT INTO wash_batch (batch_no, category_id, weight_kg, current_step, current_step_order,
                                     detergent_ml, water_temp, machine_id, operator, status,
-                                    start_time, finish_time, rewash_order_id, remark)
+                                    start_time, finish_time, rewash_order_id,
+                                    formula_version_id, formula_version_no, formula_snapshot,
+                                    review_status, remark)
             VALUES (#{batchNo}, #{categoryId}, #{weightKg}, #{currentStep}, #{currentStepOrder},
                     #{detergentMl}, #{waterTemp}, #{machineId}, #{operator}, #{status},
-                    #{startTime}, #{finishTime}, #{rewashOrderId}, #{remark})
+                    #{startTime}, #{finishTime}, #{rewashOrderId},
+                    #{formulaVersionId}, #{formulaVersionNo}, CAST(#{formulaSnapshot} AS JSON),
+                    #{reviewStatus}, #{remark})
             """)
     @Options(useGeneratedKeys = true, keyProperty = "id", keyColumn = "id")
     int insert(WashBatch batch);
@@ -192,13 +200,17 @@ public interface WashBatchMapper {
     @Options(useGeneratedKeys = true, keyProperty = "id", keyColumn = "id")
     int insertStep(BatchStep step);
 
-    /** 把上一道工序收口为 DONE */
+    /**
+     * 收口当前工序为 DONE，并把本工序实际录入的水温 / 洗涤剂用量落到流转记录（作为是否超差的事实值）。
+     */
     @Update("""
             UPDATE batch_step
-               SET status = 'DONE', end_time = NOW()
+               SET status = 'DONE', end_time = NOW(),
+                   water_temp = #{waterTemp}, detergent_ml = #{detergentMl}
              WHERE batch_id = #{batchId} AND step_code = #{stepCode}
             """)
-    int finishStep(@Param("batchId") Long batchId, @Param("stepCode") String stepCode);
+    int finishStep(@Param("batchId") Long batchId, @Param("stepCode") String stepCode,
+                   @Param("waterTemp") Integer waterTemp, @Param("detergentMl") Integer detergentMl);
 
     @Delete("DELETE FROM batch_step WHERE batch_id = #{batchId}")
     int deleteSteps(@Param("batchId") Long batchId);
@@ -224,6 +236,7 @@ public interface WashBatchMapper {
                    SUM(CASE WHEN status = 'RUNNING' THEN 1 ELSE 0 END)        AS running_batch,
                    SUM(CASE WHEN status = 'DONE' THEN 1 ELSE 0 END)           AS done_batch,
                    SUM(CASE WHEN status = 'QUARANTINED' THEN 1 ELSE 0 END)    AS quarantined_batch,
+                   SUM(CASE WHEN status = 'REVIEW' THEN 1 ELSE 0 END)         AS review_batch,
                    IFNULL(ROUND(SUM(CASE WHEN status = 'RUNNING' THEN weight_kg ELSE 0 END), 0), 0) AS running_weight
               FROM wash_batch
             """)
@@ -251,6 +264,45 @@ public interface WashBatchMapper {
              WHERE id = #{id} AND rewash_order_id IS NOT NULL
             """)
     int markRewashHeld(@Param("id") Long id);
+
+    /** 参数超差：批次转入待复核（不前进、不收口），记录本工序实际录入值，等待主管处置 */
+    @Update("""
+            UPDATE wash_batch
+               SET status = 'REVIEW', review_status = 'PENDING',
+                   water_temp = #{waterTemp}, detergent_ml = #{detergentMl}
+             WHERE id = #{id}
+            """)
+    int markReview(@Param("id") Long id,
+                   @Param("waterTemp") Integer waterTemp,
+                   @Param("detergentMl") Integer detergentMl);
+
+    /** 复核放行：批次恢复在产（停留工序不变），由主管本次推进决定前进 */
+    @Update("UPDATE wash_batch SET status = 'RUNNING', review_status = 'NONE' WHERE id = #{id}")
+    int resolveReviewPass(@Param("id") Long id);
+
+    /** 退回重做：批次恢复在产且停留在原工序（review_status 归 NONE，参数由操作员重录后再推进） */
+    @Update("UPDATE wash_batch SET status = 'RUNNING', review_status = 'NONE' WHERE id = #{id}")
+    int resolveReviewRework(@Param("id") Long id);
+
+    /** 更新当前工序（进行中）实际录入值（复核放行后重录 / 退回重做时使用），不改变工序与状态 */
+    @Update("""
+            UPDATE wash_batch
+               SET water_temp = #{waterTemp}, detergent_ml = #{detergentMl}
+             WHERE id = #{id}
+            """)
+    int updateCurrentReadings(@Param("id") Long id,
+                              @Param("waterTemp") Integer waterTemp,
+                              @Param("detergentMl") Integer detergentMl);
+
+    /** 同步更新进行中工序流转记录上的实际录入值 */
+    @Update("""
+            UPDATE batch_step
+               SET water_temp = #{waterTemp}, detergent_ml = #{detergentMl}
+             WHERE batch_id = #{batchId} AND status = 'CURRENT'
+            """)
+    int updateCurrentStepReadings(@Param("batchId") Long batchId,
+                                  @Param("waterTemp") Integer waterTemp,
+                                  @Param("detergentMl") Integer detergentMl);
 
     /** 是否存在由本批次派生的复洗记录（用于放行批次折叠完工时避免重复入库） */
     @Select("""

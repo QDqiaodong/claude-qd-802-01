@@ -35,6 +35,14 @@ public class WashBatch {
     private Long rewashOrderId;
     /** 被污染命中隔离前是否已是 DONE（放行时据此决定恢复 RUNNING 还是保持 DONE） */
     private Boolean quarantineWasDone;
+    /** 排产时所用洗涤配方版本 id（仅留存，不实时回读配方表） */
+    private Long formulaVersionId;
+    /** 排产时配方版本号（冗余） */
+    private String formulaVersionNo;
+    /** 排产时完整配方快照原始 JSON */
+    private String formulaSnapshot;
+    /** NONE 正常 / PENDING 参数超差待主管复核（status 同步为 REVIEW） */
+    private String reviewStatus;
     private String remark;
 
     // ------- 非表字段 -------
@@ -43,6 +51,10 @@ public class WashBatch {
     private String machineCode;
     /** 进度百分比 */
     private Integer progress;
+    /** 解析后的配方快照（隧道 / 详情展示标准参数、超差判定都用它） */
+    private com.linen.laundry.dto.BatchFormulaSnapshot formula;
+    /** 当前待复核记录（review_status=PENDING 时带出） */
+    private com.linen.laundry.domain.BatchFormulaReview pendingReview;
     /** 工序流转记录（嵌套 @Many 带出） */
     private List<BatchStep> steps;
     /** 品类（嵌套 @One 带出） */

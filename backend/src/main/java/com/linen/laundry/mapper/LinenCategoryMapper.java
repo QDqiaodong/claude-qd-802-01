@@ -27,8 +27,10 @@ public interface LinenCategoryMapper {
             SELECT c.*,
                    GREATEST(0, c.min_turnover - c.stock_qty)                       AS gap,
                    ROUND(c.stock_qty * c.unit_price, 2)                            AS stock_amount,
-                   (SELECT COUNT(*) FROM wash_batch b WHERE b.category_id = c.id)  AS batch_count
+                   (SELECT COUNT(*) FROM wash_batch b WHERE b.category_id = c.id)  AS batch_count,
+                   fv.version_no                                                    AS current_formula_version_no
               FROM linen_category c
+              LEFT JOIN formula_version fv ON fv.id = c.current_formula_version_id
              ORDER BY gap DESC, c.id
             """)
     @Results(id = "categoryMap", value = {
@@ -39,8 +41,11 @@ public interface LinenCategoryMapper {
             @Result(property = "stockQty", column = "stock_qty"),
             @Result(property = "scrapRate", column = "scrap_rate"),
             @Result(property = "minTurnover", column = "min_turnover"),
+            @Result(property = "currentFormulaVersionId", column = "current_formula_version_id"),
+            @Result(property = "formulaSeq", column = "formula_seq"),
             @Result(property = "gap", column = "gap"),
             @Result(property = "stockAmount", column = "stock_amount"),
+            @Result(property = "currentFormulaVersionNo", column = "current_formula_version_no"),
             @Result(property = "recentBatches", column = "id",
                     many = @Many(select = "com.linen.laundry.mapper.WashBatchMapper.selectByCategoryId"))
     })
@@ -56,6 +61,23 @@ public interface LinenCategoryMapper {
               FROM linen_category c WHERE c.id = #{id}
             """)
     LinenCategory selectById(@Param("id") Long id);
+
+    /** 行锁：发布 / 停用切换配方时锁品类行，串行化同品类并发版本操作 */
+    @Select("SELECT * FROM linen_category WHERE id = #{id} FOR UPDATE")
+    LinenCategory selectByIdForUpdate(@Param("id") Long id);
+
+    /**
+     * CAS 切换当前配方版本：仅当 formula_seq 未被其它事务改动时生效。
+     * 并发发布两份草稿时，先提交者 seq+1，后提交者更新 0 行 → 得到明确冲突结果。
+     */
+    @Update("""
+            UPDATE linen_category
+               SET current_formula_version_id = #{versionId}, formula_seq = formula_seq + 1
+             WHERE id = #{categoryId} AND formula_seq = #{expectedSeq}
+            """)
+    int compareAndSetCurrentFormula(@Param("categoryId") Long categoryId,
+                                    @Param("versionId") Long versionId,
+                                    @Param("expectedSeq") Integer expectedSeq);
 
     @Select("SELECT * FROM linen_category WHERE code = #{code}")
     LinenCategory selectByCode(@Param("code") String code);

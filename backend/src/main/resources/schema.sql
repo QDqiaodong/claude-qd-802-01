@@ -44,6 +44,8 @@ CREATE TABLE IF NOT EXISTS linen_category (
   min_turnover INT          NOT NULL DEFAULT 0      COMMENT '最低周转量（件）',
   owner_type   VARCHAR(16)  NOT NULL DEFAULT 'COMMON' COMMENT 'HOTEL / HOSPITAL / COMMON',
   remark       VARCHAR(128)          DEFAULT NULL   COMMENT '备注（洗涤要点）',
+  current_formula_version_id BIGINT     DEFAULT NULL COMMENT '当前生效洗涤配方版本 id（每品类至多一个）；为空表示无当前版本，新批次不可排产',
+  formula_seq  INT          NOT NULL DEFAULT 0      COMMENT '当前版本切换序号：发布 / 停用切换走 CAS 乐观锁，并发只有一份生效',
   PRIMARY KEY (id),
   UNIQUE KEY uk_category_code (code)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='布草品类台账';
@@ -95,18 +97,24 @@ CREATE TABLE IF NOT EXISTS wash_batch (
   water_temp        INT          NOT NULL DEFAULT 0  COMMENT '水温 ℃',
   machine_id        BIGINT                DEFAULT NULL COMMENT '水洗机 id',
   operator          VARCHAR(32)           DEFAULT NULL COMMENT '当班操作员',
-  status            VARCHAR(16)  NOT NULL DEFAULT 'RUNNING' COMMENT 'RUNNING 在产 / HOLD 挂起 / DONE 已完成 / QUARANTINED 污染隔离中',
+  status            VARCHAR(16)  NOT NULL DEFAULT 'RUNNING' COMMENT 'RUNNING 在产 / HOLD 挂起 / DONE 已完成 / QUARANTINED 污染隔离中 / REVIEW 参数超差待复核',
   start_time        DATETIME              DEFAULT NULL,
   finish_time       DATETIME              DEFAULT NULL,
   rewash_order_id   BIGINT                DEFAULT NULL COMMENT '若本批次是污染复洗产生的新批次，对应复洗单 id；否则为空',
   quarantine_was_done TINYINT  NOT NULL DEFAULT 0 COMMENT '被污染命中隔离前是否已是 DONE 批次（放行时据此决定恢复 RUNNING 还是保持 DONE）',
+  formula_version_id BIGINT               DEFAULT NULL COMMENT '排产时所用洗涤配方版本 id（仅留存，不实时回读配方表）',
+  formula_version_no VARCHAR(32)          DEFAULT NULL COMMENT '排产时配方版本号（冗余，便于直接展示）',
+  formula_snapshot  JSON                  DEFAULT NULL COMMENT '排产时完整配方快照（八道工序标准参数 / 容差 / 设备类型 / 最大装载比例），批次全程只认快照，后续发布或停用不改写在产批次',
+  review_status     VARCHAR(16)  NOT NULL DEFAULT 'NONE' COMMENT 'NONE 正常 / PENDING 参数超差待主管复核；批次 status 同步置为 REVIEW',
   remark            VARCHAR(255)          DEFAULT NULL,
   PRIMARY KEY (id),
   UNIQUE KEY uk_batch_no (batch_no),
   KEY idx_batch_category (category_id),
   KEY idx_batch_machine (machine_id),
   KEY idx_batch_status (status),
-  KEY idx_batch_rewash (rewash_order_id)
+  KEY idx_batch_rewash (rewash_order_id),
+  KEY idx_batch_formula (formula_version_id),
+  KEY idx_batch_review (review_status)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='洗涤批次';
 
 -- ---------- 6. 工序流转记录 ----------
@@ -245,6 +253,83 @@ CREATE TABLE IF NOT EXISTS rewash_order (
   KEY idx_rewash_status (status)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='污染批次复洗单';
 
+-- ---------- 13. 洗涤配方版本（配方版本台） ----------
+-- 按布草品类维护预洗→折叠八道工序的目标水温、洗涤剂用量（容差）与适用设备类型、最大装载比例。
+-- 状态机：DRAFT 草稿（可反复改）→ PUBLISHED 当前生效；PUBLISHED → ARCHIVED 历史归档（被新版本接替 / 停用切换后）。
+-- 已发布版本内容不可原地改写，只能复制成新草稿（formula_version.copy_from_id）再发布。
+-- current_flag 为存储生成列：仅 PUBLISHED 为 1，其余为 NULL；UNIQUE(category_id, current_flag)
+-- 在数据库层兜底「每个品类同时只能有一个当前版本」，并发发布两份草稿时唯一索引让后提交者失败。
+CREATE TABLE IF NOT EXISTS formula_version (
+  id              BIGINT       NOT NULL AUTO_INCREMENT,
+  version_no      VARCHAR(32)  NOT NULL                COMMENT '版本号 FV+品类码-V序号',
+  category_id     BIGINT       NOT NULL                COMMENT '布草品类 id',
+  version_seq     INT          NOT NULL DEFAULT 1      COMMENT '该品类内版本序号（V1/V2…）',
+  status          VARCHAR(16)  NOT NULL DEFAULT 'DRAFT' COMMENT 'DRAFT 草稿 / PUBLISHED 当前生效 / ARCHIVED 历史归档',
+  machine_types   VARCHAR(128) NOT NULL                COMMENT '可承接设备类型，逗号分隔，如 WASHER / WASHER,DRYER,IRONER',
+  max_load_ratio  DECIMAL(4,2) NOT NULL DEFAULT 1.00   COMMENT '最大装载比例（占设备额定容量），如 0.90 表示最多装到容量 90%',
+  temp_tolerance  INT          NOT NULL DEFAULT 5      COMMENT '水温容差 ±℃',
+  detergent_tolerance DECIMAL(5,2) NOT NULL DEFAULT 10.00 COMMENT '洗涤剂用量容差 ±%',
+  copy_from_id    BIGINT                DEFAULT NULL   COMMENT '本版本由哪个版本复制而来（已发布版本只能复制改版，不可原地改写）',
+  created_by      VARCHAR(32)           DEFAULT NULL   COMMENT '创建人',
+  published_by    VARCHAR(32)           DEFAULT NULL   COMMENT '发布人',
+  published_at    DATETIME              DEFAULT NULL   COMMENT '发布时间',
+  remark          VARCHAR(255)          DEFAULT NULL   COMMENT '版本说明（改了什么、为什么改）',
+  current_flag    TINYINT GENERATED ALWAYS AS (CASE WHEN status = 'PUBLISHED' THEN 1 ELSE NULL END) STORED COMMENT '当前版本标记，配合唯一索引保证每品类至多一个 PUBLISHED',
+  created_at      DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (id),
+  UNIQUE KEY uk_formula_version_no (version_no),
+  UNIQUE KEY uk_formula_current (category_id, current_flag),
+  KEY idx_formula_category (category_id),
+  KEY idx_formula_status (status)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='洗涤配方版本';
+
+-- ---------- 14. 洗涤配方工序参数 ----------
+-- 一个配方版本固定八行（预洗…折叠）。发布前必须校验八道工序齐全、目标水温 0~180℃、
+-- 洗涤剂用量 0~5000ml 合法；工序编码必须落在 WashProcess.STEP_CODES 内。
+CREATE TABLE IF NOT EXISTS formula_step_param (
+  id              BIGINT       NOT NULL AUTO_INCREMENT,
+  version_id      BIGINT       NOT NULL                COMMENT '配方版本 id',
+  step_code       VARCHAR(16)  NOT NULL                COMMENT '工序编码 PRE_WASH…FOLD',
+  step_name       VARCHAR(16)  NOT NULL                COMMENT '工序名称',
+  step_order      INT          NOT NULL                COMMENT '工序号 1~8',
+  target_temp     INT          NOT NULL DEFAULT 0      COMMENT '目标水温 ℃（脱水 / 折叠可为 0）',
+  target_detergent_ml INT      NOT NULL DEFAULT 0      COMMENT '目标洗涤剂用量 ml（过水 / 脱水 / 烫平 / 折叠可为 0）',
+  PRIMARY KEY (id),
+  UNIQUE KEY uk_formula_step (version_id, step_code),
+  KEY idx_step_version (version_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='洗涤配方工序参数';
+
+-- ---------- 15. 批次参数超差复核记录 ----------
+-- 推进工序时实际水温或洗涤剂用量超出该批次配方快照容差，先落一条 PENDING 复核并把批次置为 REVIEW，
+-- 而不是直接前进。主管填写原因后选择 PASS 按本批次放行 或 REWORK 退回重做；
+-- pending_flag 为存储生成列：仅 PENDING 为 1，配合 UNIQUE(batch_id, step_order, pending_flag)
+-- 保证同一批次同一工序至多一条待复核记录。复核结论只作用于本批次，不改写配方。
+CREATE TABLE IF NOT EXISTS batch_formula_review (
+  id               BIGINT       NOT NULL AUTO_INCREMENT,
+  batch_id         BIGINT       NOT NULL                COMMENT '批次 id',
+  step_code        VARCHAR(16)  NOT NULL                COMMENT '触发超差的工序编码',
+  step_name        VARCHAR(16)  NOT NULL                COMMENT '触发超差的工序名称',
+  step_order       INT          NOT NULL                COMMENT '工序号 1~8',
+  formula_version_id BIGINT              DEFAULT NULL   COMMENT '当时批次采用的配方版本 id',
+  target_temp      INT          NOT NULL DEFAULT 0      COMMENT '配方目标水温（快照值）',
+  actual_temp      INT          NOT NULL DEFAULT 0      COMMENT '实际录入水温',
+  target_detergent_ml INT       NOT NULL DEFAULT 0      COMMENT '配方目标洗涤剂用量（快照值）',
+  actual_detergent_ml INT       NOT NULL DEFAULT 0      COMMENT '实际录入洗涤剂用量',
+  temp_tolerance   INT          NOT NULL DEFAULT 0      COMMENT '当时水温容差 ±℃',
+  detergent_tolerance DECIMAL(5,2) NOT NULL DEFAULT 0   COMMENT '当时洗涤剂容差 ±%',
+  deviation_desc   VARCHAR(255) NOT NULL                COMMENT '超差项与幅度说明（如 实际水温 80℃，目标 70±5℃）',
+  status           VARCHAR(16)  NOT NULL DEFAULT 'PENDING' COMMENT 'PENDING 待复核 / PASS 按本批次放行 / REWORK 退回重做',
+  review_reason    VARCHAR(255)          DEFAULT NULL   COMMENT '主管填写的复核原因 / 说明',
+  reviewer         VARCHAR(32)           DEFAULT NULL   COMMENT '复核主管',
+  reviewed_at      DATETIME              DEFAULT NULL   COMMENT '复核时间',
+  pending_flag     TINYINT GENERATED ALWAYS AS (CASE WHEN status = 'PENDING' THEN 1 ELSE NULL END) STORED COMMENT '待复核标记，配合唯一索引保证同批同工序至多一条待复核',
+  created_at       DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (id),
+  KEY idx_review_batch (batch_id),
+  UNIQUE KEY uk_review_pending (batch_id, step_order, pending_flag),
+  KEY idx_review_status (status)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='批次参数超差复核记录';
+
 
 -- ---------- 种子数据：客户网点（12 家） ----------
 INSERT INTO outlet (code, name, outlet_type, district, contact, phone, settle_type,
@@ -287,6 +372,48 @@ INSERT INTO machine (code, name, model, machine_type, capacity_kg, status,
   ('DR-03', '3号烘干机', 'HGQ-50 电加热', 'DRYER', 50.00, 'FAULT', 7630.9, '后整理 B 区', '2026-05-22'),
   ('IR-01', '1号烫平机', 'TPII-3000 三辊', 'IRONER', 60.00, 'RUNNING', 6540.6, '后整理 C 区', '2026-07-16'),
   ('IR-02', '2号烫平机', 'TPII-2400 双辊', 'IRONER', 40.00, 'IDLE', 5120.1, '后整理 C 区', '2026-07-16');
+
+-- ---------- 种子数据：各品类当前生效配方 V1（8 份，均为 PUBLISHED） ----------
+-- 八道工序目标水温沿用全厂默认工艺（35/70/45/40/0/75/160/0），洗涤剂目标用量按品类设定（过水类工序为 0）。
+-- 每份配方可承接设备都含 WASHER（排产入口是水洗机），手术衣单独缸走隔离式水洗机靠设备容量/编号人工选择，配方不做硬隔离。
+INSERT INTO formula_version (version_no, category_id, version_seq, status, machine_types,
+                             max_load_ratio, temp_tolerance, detergent_tolerance, copy_from_id,
+                             created_by, published_by, published_at, remark, created_at) VALUES
+  ('FV-LC-BED-V1', 1, 1, 'PUBLISHED', 'WASHER', 0.90, 5, 10.00, NULL, '工艺员-赵工', '车间主任-钱主任', DATE_SUB(NOW(), INTERVAL 60 DAY), '床单基线配方 V1：主洗 70℃，氯漂慎用', DATE_SUB(NOW(), INTERVAL 60 DAY)),
+  ('FV-LC-QUI-V1', 2, 1, 'PUBLISHED', 'WASHER', 0.85, 5, 10.00, NULL, '工艺员-赵工', '车间主任-钱主任', DATE_SUB(NOW(), INTERVAL 60 DAY), '被套基线配方 V1：脱水后必须抖散再烘干', DATE_SUB(NOW(), INTERVAL 60 DAY)),
+  ('FV-LC-PIL-V1', 3, 1, 'PUBLISHED', 'WASHER', 0.90, 5, 10.00, NULL, '工艺员-赵工', '车间主任-钱主任', DATE_SUB(NOW(), INTERVAL 60 DAY), '枕套基线配方 V1：易夹带，预洗加长 3 分钟', DATE_SUB(NOW(), INTERVAL 60 DAY)),
+  ('FV-LC-TWL-V1', 4, 1, 'PUBLISHED', 'WASHER,DRYER', 0.80, 5, 10.00, NULL, '工艺员-赵工', '车间主任-钱主任', DATE_SUB(NOW(), INTERVAL 60 DAY), '浴巾基线配方 V1：烘干温度不超过 80℃', DATE_SUB(NOW(), INTERVAL 60 DAY)),
+  ('FV-LC-TAB-V1', 5, 1, 'PUBLISHED', 'WASHER', 0.85, 5, 12.00, NULL, '工艺员-赵工', '车间主任-钱主任', DATE_SUB(NOW(), INTERVAL 55 DAY), '台布基线配方 V1：重油污需预涂去渍剂，洗涤剂量上浮', DATE_SUB(NOW(), INTERVAL 55 DAY)),
+  ('FV-LC-UNI-V1', 6, 1, 'PUBLISHED', 'WASHER', 0.80, 5, 10.00, NULL, '工艺员-赵工', '车间主任-钱主任', DATE_SUB(NOW(), INTERVAL 55 DAY), '工服基线配方 V1：按部门分色分缸洗', DATE_SUB(NOW(), INTERVAL 55 DAY)),
+  ('FV-LC-SUR-V1', 7, 1, 'PUBLISHED', 'WASHER,DRYER', 0.75, 3, 8.00, NULL, '工艺员-赵工', '感控员-郑雅芳', DATE_SUB(NOW(), INTERVAL 50 DAY), '手术衣医感配方 V1：单独缸、单独烘干，容差收紧', DATE_SUB(NOW(), INTERVAL 50 DAY)),
+  ('FV-LC-PAT-V1', 8, 1, 'PUBLISHED', 'WASHER', 0.85, 5, 10.00, NULL, '工艺员-赵工', '感控员-郑雅芳', DATE_SUB(NOW(), INTERVAL 50 DAY), '病号服基线配方 V1：高温 75℃ 主洗，加消毒中和', DATE_SUB(NOW(), INTERVAL 50 DAY));
+
+-- 每份配方八道工序目标参数：target_temp 按 35/70/45/40/0/75/160/0；target_detergent_ml 仅预洗、主洗两道投放，其余工序为 0。
+-- 主洗洗涤剂目标用量（ml）按品类：床单 900 / 被套 950 / 枕套 600 / 浴巾 800 / 台布 1200 / 工服 750 / 手术衣 550 / 病号服 650。
+INSERT INTO formula_step_param (version_id, step_code, step_name, step_order, target_temp, target_detergent_ml)
+SELECT f.id, g.step_code, g.step_name, g.step_order, g.target_temp,
+       CASE
+         WHEN g.step_code IN ('PRE_WASH','MAIN_WASH') THEN
+           CASE f.category_id WHEN 1 THEN 900 WHEN 2 THEN 950 WHEN 3 THEN 600 WHEN 4 THEN 800
+                             WHEN 5 THEN 1200 WHEN 6 THEN 750 WHEN 7 THEN 550 WHEN 8 THEN 650 END
+         ELSE 0 END
+  FROM formula_version f
+  JOIN (
+    SELECT 'PRE_WASH' AS step_code, '预洗' AS step_name, 1 AS step_order, 35 AS target_temp UNION ALL
+    SELECT 'MAIN_WASH', '主洗', 2, 70 UNION ALL
+    SELECT 'RINSE', '漂洗', 3, 45 UNION ALL
+    SELECT 'NEUTRALIZE', '中和', 4, 40 UNION ALL
+    SELECT 'EXTRACT', '脱水', 5, 0 UNION ALL
+    SELECT 'DRY', '烘干', 6, 75 UNION ALL
+    SELECT 'IRON', '烫平', 7, 160 UNION ALL
+    SELECT 'FOLD', '折叠', 8, 0
+  ) g
+ WHERE f.status = 'PUBLISHED';
+
+-- 回填品类当前生效配方指针
+UPDATE linen_category c
+  JOIN formula_version f ON f.category_id = c.id AND f.status = 'PUBLISHED'
+   SET c.current_formula_version_id = f.id, c.formula_seq = 1;
 
 -- ---------- 种子数据：收送单（12 张，覆盖已收待送 / 已送达 / 已结算） ----------
 INSERT INTO pickup_order (order_no, outlet_id, pickup_time, deliver_time, dirty_qty, clean_qty,
@@ -423,6 +550,25 @@ UPDATE batch_step s JOIN wash_batch b ON b.id = s.batch_id
        WHEN s.step_order = 6  THEN 6
        WHEN s.step_order = 7  THEN 9
        ELSE NULL END;
+
+-- ---------- 回填历史种子批次的配方版本与完整快照 ----------
+-- 历史批次同样只认快照：即使以后发布 V2 / 停用切换，这 11 缸在产批次隧道与详情仍按建批时的 V1 参数展示与复核。
+UPDATE wash_batch b
+  JOIN formula_version fv ON fv.id = (
+      SELECT f.id FROM formula_version f
+       WHERE f.category_id = b.category_id AND f.status = 'PUBLISHED' LIMIT 1)
+   SET b.formula_version_id = fv.id,
+       b.formula_version_no = fv.version_no,
+       b.formula_snapshot = JSON_OBJECT(
+         'versionId', fv.id, 'versionNo', fv.version_no, 'categoryId', fv.category_id,
+         'machineTypes', fv.machine_types, 'maxLoadRatio', fv.max_load_ratio,
+         'tempTolerance', fv.temp_tolerance, 'detergentTolerance', fv.detergent_tolerance,
+         'steps', (
+           SELECT JSON_ARRAYAGG(JSON_OBJECT(
+                    'stepCode', p.step_code, 'stepName', p.step_name, 'stepOrder', p.step_order,
+                    'targetTemp', p.target_temp, 'targetDetergentMl', p.target_detergent_ml)
+                    ORDER BY p.step_order)
+             FROM formula_step_param p WHERE p.version_id = fv.id));
 
 -- ---------- 种子数据：一条待确认的医院布草污染事件 ----------
 -- 4 号隔离式水洗机（医感专区）晨间污染；确认后会按设备占用时段命中在该机漂洗的 PC-...-004（手术衣）。
